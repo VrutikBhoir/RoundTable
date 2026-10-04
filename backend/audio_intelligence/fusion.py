@@ -22,6 +22,8 @@ class FusionStore:
         ambiguous: bool = False,
         language: str = "unknown",
         is_final: bool = True,
+        source_quality: float = 0.0,
+        overlap_participants: list[str] | None = None,
     ) -> FusedEntry | None:
         text = text.strip()
         if not text:
@@ -56,8 +58,10 @@ class FusionStore:
             text=text,
             confidence=round(confidence, 3),
             source_participant_id=source_participant_id,
+            source_quality=source_quality,
             ambiguous=ambiguous,
             language=language,
+            overlap_participants=overlap_participants,
             is_final=is_final,
         )
         self.entries.append(entry)

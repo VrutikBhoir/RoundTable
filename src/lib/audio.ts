@@ -36,6 +36,23 @@ export async function requestMicrophone(deviceId?: string): Promise<MediaStream>
   });
 }
 
+export function microphoneProcessingStatus(stream: MediaStream): "ON" | "OFF" | "UNAVAILABLE" {
+  const track = stream.getAudioTracks()[0];
+  if (!track) return "UNAVAILABLE";
+  const settings = track.getSettings();
+  if (
+    settings.noiseSuppression === true &&
+    settings.echoCancellation === true &&
+    settings.autoGainControl === true
+  ) return "ON";
+  if (
+    settings.noiseSuppression === false ||
+    settings.echoCancellation === false ||
+    settings.autoGainControl === false
+  ) return "OFF";
+  return "UNAVAILABLE";
+}
+
 export async function listAudioInputs(): Promise<MediaDeviceInfo[]> {
   if (!microphoneSupported()) return [];
   const devices = await navigator.mediaDevices.enumerateDevices();

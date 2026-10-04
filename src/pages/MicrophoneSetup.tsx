@@ -21,6 +21,8 @@ import {
   type LevelMonitor,
   type MicrophoneFailure,
 } from "../lib/audio";
+import { apiBaseUrl, getVoiceStatus } from "../lib/api";
+import { enrollVoiceProfile } from "../lib/voiceEnrollment";
 
 type ParticipantSession = {
   invitationToken?: string;
@@ -33,9 +35,25 @@ type ParticipantSession = {
 };
 
 type PermissionState = "unknown" | "requesting" | "granted" | MicrophoneFailure;
+type EnrollmentState = "idle" | "recording" | "processing" | "ready" | "failed" | "skipped";
 
 const TEST_DURATION_MS = 4000;
 const PASS_THRESHOLD = 0.04;
+
+function formatDuration(seconds: number): string {
+  const wholeSeconds = Math.max(0, Math.floor(seconds));
+  return `00:${String(wholeSeconds).padStart(2, "0")}`;
+}
+
+function formatEnrollmentError(message: string): string {
+  if (message.startsWith("Not enough speech detected.")) {
+    return message;
+  }
+  if (/insufficient_speech/i.test(message)) {
+    return "Not enough speech detected.";
+  }
+  return message;
+}
 
 function readParticipantSession(): ParticipantSession | null {
   try {
@@ -64,6 +82,11 @@ export default function MicrophoneSetup() {
   });
   const [seatSkipped, setSeatSkipped] = useState(false);
   const [disconnected, setDisconnected] = useState(false);
+  const [enrollment, setEnrollment] = useState<EnrollmentState>("idle");
+  const [enrollmentProgress, setEnrollmentProgress] = useState(0);
+  const [speechSeconds, setSpeechSeconds] = useState<number | null>(null);
+  const [enrollmentError, setEnrollmentError] = useState<string | null>(null);
+  const [enrollmentDuration, setEnrollmentDuration] = useState<number | null>(null);
 
   const streamRef = useRef<MediaStream | null>(null);
   const monitorRef = useRef<LevelMonitor | null>(null);
@@ -72,6 +95,33 @@ export default function MicrophoneSetup() {
   const getLevel = useCallback(() => monitorRef.current?.getLevel() ?? 0, []);
 
   /* Stop the local stream when the page is abandoned. */
+  useEffect(() => {
+    if (!participant?.sessionId || !participant.participantId || !participant.participantToken) return;
+    let active = true;
+    void getVoiceStatus(participant.sessionId, {
+      participant_id: participant.participantId,
+      participant_token: participant.participantToken,
+    }).then((status) => {
+      console.debug("[voice] setup profile lookup", {
+        session_id: participant.sessionId,
+        participant_id: participant.participantId,
+        status: status.status,
+      });
+      if (!active) return;
+      setEnrollmentDuration(status.enrollment_duration_seconds);
+      if (status.status === "ready") setEnrollment("ready");
+    }).catch((error) => {
+      console.warn("[voice] setup profile lookup failed", {
+        session_id: participant.sessionId,
+        participant_id: participant.participantId,
+        error: error instanceof Error ? error.message : error,
+      });
+    });
+    return () => {
+      active = false;
+    };
+  }, [participant?.sessionId, participant?.participantId, participant?.participantToken]);
+
   useEffect(() => {
     return () => {
       cancelAnimationFrame(testRaf.current);
@@ -158,9 +208,52 @@ export default function MicrophoneSetup() {
     }
   }
 
-  // 01 microphone → 02 test → 03 position → 04 ready
-  const stepIndex = permission !== "granted" ? 0 : test !== "passed" ? 1 : seat || seatSkipped ? 3 : 2;
-  const ready = permission === "granted" && test === "passed" && !disconnected;
+  async function startVoiceEnrollment() {
+    if (!streamRef.current || !participant?.sessionId || !enrollmentDuration) return;
+    if (!participant.participantId || !participant.participantToken) {
+      setEnrollmentError("Your participant identity is missing. Return to the join page and request access again.");
+      setEnrollment("failed");
+      return;
+    }
+    setEnrollment("recording");
+    setEnrollmentProgress(0);
+    setSpeechSeconds(null);
+    setEnrollmentError(null);
+    try {
+      const result = await enrollVoiceProfile({
+        stream: streamRef.current,
+        endpoint: `${apiBaseUrl()}/api/sessions/${encodeURIComponent(participant.sessionId)}/voice-enrollment`,
+        credentials: {
+          participant_id: participant.participantId,
+          participant_token: participant.participantToken,
+        },
+        seconds: enrollmentDuration,
+        onProgress: setEnrollmentProgress,
+        onProcessing: () => setEnrollment("processing"),
+      });
+      console.debug("[voice] setup enrollment response", {
+        session_id: participant.sessionId,
+        participant_id: result.participantId,
+        speech_seconds: result.speechSeconds,
+        recording_seconds: result.recordingSeconds,
+      });
+      setSpeechSeconds(result.speechSeconds);
+      setEnrollment("ready");
+    } catch (error) {
+      setEnrollmentError(error instanceof Error ? error.message : "Voice enrollment failed.");
+      setEnrollment("failed");
+    }
+  }
+
+  function skipVoiceEnrollment() {
+    setEnrollment("skipped");
+    setEnrollmentError(null);
+  }
+
+  // 01 microphone → 02 test → 03 voice profile → 04 position → 05 ready
+  const voiceComplete = enrollment === "ready" || enrollment === "skipped";
+  const stepIndex = permission !== "granted" ? 0 : test !== "passed" ? 1 : !voiceComplete ? 2 : !(seat || seatSkipped) ? 3 : 4;
+  const ready = permission === "granted" && test === "passed" && voiceComplete && !disconnected;
 
   function continueToLiveSession() {
     if (!participant || !participant.sessionId) {
@@ -298,7 +391,93 @@ export default function MicrophoneSetup() {
                       }}
                     />
 
-                    {test === "passed" && (
+                    {test === "passed" && !voiceComplete && (
+                      <motion.section
+                        aria-label="Voice profile"
+                        initial={{ opacity: 0, y: 10 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        transition={{ duration: 0.3 }}
+                        className="rounded-2xl border border-[#E4E4E0] p-5"
+                      >
+                        <p className="font-mono text-[11px] uppercase tracking-[0.14em] text-[#8A8A86]">Voice profile</p>
+                        <h2 className="mt-2 text-[20px] font-bold">Create your voice profile</h2>
+                        <p className="mt-2 text-[14px] leading-relaxed text-[#666]">
+                          Speak naturally for a few seconds. Roundtable uses this profile as one signal when identifying speakers.
+                        </p>
+
+                        {enrollment === "recording" && (
+                          <div className="mt-5">
+                            <div className="flex items-center justify-between text-[14px] font-semibold">
+                              <span>Recording voice profile</span>
+                              <span className="font-mono tabular-nums">{formatDuration(enrollmentProgress)} / {formatDuration(enrollmentDuration ?? 0)}</span>
+                            </div>
+                            <div className="mt-4">
+                              <AudioLevelMeter getLevel={getLevel} live label="Voice profile microphone level" />
+                            </div>
+                          </div>
+                        )}
+
+                        {enrollment === "processing" && (
+                          <p className="mt-5 rounded-xl bg-[#F7F7F5] px-4 py-3 text-[14px] font-semibold" role="status">
+                            Processing voice profile...
+                          </p>
+                        )}
+
+                        {enrollment === "failed" && enrollmentError && (
+                          <div className="mt-5 rounded-xl border border-[#E8B4B4] bg-[#FFF5F5] p-4 text-[14px]" role="alert">
+                            <p className="font-semibold">{formatEnrollmentError(enrollmentError)}</p>
+                            {enrollmentError.startsWith("Not enough speech detected.") && (
+                              <p className="mt-2 text-[#666]">
+                                Please speak naturally and try again.
+                              </p>
+                            )}
+                          </div>
+                        )}
+
+                        {enrollment !== "recording" && enrollment !== "processing" && (
+                          <div className="mt-5 space-y-3">
+                            <button
+                              type="button"
+                              onClick={() => void startVoiceEnrollment()}
+                              disabled={permission !== "granted" || disconnected || enrollmentDuration === null}
+                              className="inline-flex min-h-[48px] w-full items-center justify-center rounded-full bg-[#635BFF] px-6 py-3 text-[14px] font-semibold text-white transition hover:-translate-y-[1px] disabled:cursor-not-allowed disabled:opacity-40"
+                            >
+                              {enrollment === "failed" ? "Record again" : "Start recording"}
+                            </button>
+                            <div className="text-center">
+                              <button
+                                type="button"
+                                onClick={skipVoiceEnrollment}
+                                className="min-h-[44px] px-4 py-2 text-[13px] font-semibold text-[#666] underline-offset-4 hover:text-[#111] hover:underline"
+                              >
+                                Continue without voice profile
+                              </button>
+                              <p className="mt-1 text-[12px] text-[#8A8A86]">Speaker identification may be less accurate.</p>
+                            </div>
+                          </div>
+                        )}
+                      </motion.section>
+                    )}
+
+                    {test === "passed" && voiceComplete && (
+                      <div className="rounded-2xl border border-[#18A874]/30 bg-[#18A874]/10 p-4" role="status">
+                        <div className="flex items-start gap-2">
+                          <CheckCircle2 className="mt-0.5 h-5 w-5 shrink-0 text-[#18A874]" />
+                          <div>
+                            <p className="text-[14px] font-semibold">Voice Profile · {enrollment === "ready" ? "Ready" : "Skipped"}</p>
+                            {enrollment === "ready" && speechSeconds !== null && (
+                              <>
+                                <p className="mt-1 text-[13px] text-[#245C47]">Speech detected: {speechSeconds.toFixed(1)} seconds</p>
+                                <p className="mt-1 text-[13px] text-[#245C47]">Voice profile is ready for speaker verification.</p>
+                              </>
+                            )}
+                            {enrollment === "skipped" && <p className="mt-1 text-[13px] text-[#666]">Speaker identification may be less accurate.</p>}
+                          </div>
+                        </div>
+                      </div>
+                    )}
+
+                    {test === "passed" && voiceComplete && (
                       <motion.section
                         aria-label="Where are you sitting?"
                         initial={{ opacity: 0, y: 10 }}
@@ -321,6 +500,16 @@ export default function MicrophoneSetup() {
                       </p>
                     ) : null}
 
+                    <div className="space-y-3">
+                      <div className="rounded-2xl border border-[#E4E4E0] p-4 text-[13px] text-[#555]">
+                        <p className="font-semibold text-[#111]">Before you enter</p>
+                        <ul className="mt-2 space-y-1.5">
+                          <li>✓ Microphone connected</li>
+                          <li>✓ Microphone tested</li>
+                          <li>{enrollment === "ready" ? "✓ Voice profile ready" : "✓ Voice profile skipped"}</li>
+                          <li>{seat || seatSkipped ? "✓ Position selected or skipped" : "○ Position optional"}</li>
+                        </ul>
+                      </div>
                     <button
                       type="button"
                       disabled={!ready}
@@ -335,6 +524,7 @@ export default function MicrophoneSetup() {
                         "Complete the microphone test to continue"
                       )}
                     </button>
+                    </div>
                   </motion.div>
                 )}
               </AnimatePresence>

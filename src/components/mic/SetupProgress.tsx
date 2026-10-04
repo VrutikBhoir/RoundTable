@@ -1,6 +1,6 @@
 import { cn } from "../../lib/utils";
 
-const STEPS = ["Microphone", "Test", "Position", "Ready"];
+const STEPS = ["Microphone", "Test", "Voice Profile", "Position", "Ready"];
 
 export default function SetupProgress({ current }: { current: number }) {
   return (

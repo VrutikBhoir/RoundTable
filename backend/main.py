@@ -1,11 +1,15 @@
 import asyncio
 import os
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 try:
     from dotenv import load_dotenv
 
-    load_dotenv()  # must run before module-level os.getenv reads below
+    # Load the project-local tunnel settings before module-level environment
+    # reads. The frontend and backend share this file during local development.
+    load_dotenv(Path(__file__).resolve().parent.parent / ".env.local")
+    load_dotenv()
 except ImportError:
     pass
 
@@ -51,7 +55,10 @@ configured_origins = [
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173", *configured_origins],
-    allow_origin_regex=r"https?://(?:[^/]+:5173|[a-zA-Z0-9-]+\.ngrok(?:-free)?\.(?:app|dev|io))",
+    allow_origin_regex=(
+        r"https?://(?:[^/]+:5173|[a-zA-Z0-9-]+\.ngrok(?:-free)?\.(?:app|dev|io)"
+        r"|[a-zA-Z0-9-]+\.inc\d+\.devtunnels\.ms)"
+    ),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

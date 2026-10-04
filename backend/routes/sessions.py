@@ -1,3 +1,5 @@
+import os
+
 from fastapi import APIRouter, Header, HTTPException, Request
 
 from ..deps import authorized_session, domain_error, host_token_header, store
@@ -7,6 +9,9 @@ router = APIRouter(tags=["sessions"])
 
 
 def frontend_origin(request: Request) -> str:
+    configured = os.getenv("PUBLIC_APP_URL", "").strip().rstrip("/")
+    if configured:
+        return configured
     return request.headers.get("origin") or "http://localhost:5173"
 
 

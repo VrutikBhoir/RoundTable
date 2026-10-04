@@ -4,7 +4,7 @@ The rest of the application only needs these shapes — never VAD/Whisper
 internals. All audio is mono float32 at 16 kHz unless stated otherwise.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 SAMPLE_RATE = 16000
 
@@ -48,8 +48,10 @@ class FusedEntry:
     text: str
     confidence: float
     source_participant_id: str
+    source_quality: float = 0.0
     ambiguous: bool = False
     language: str = "unknown"
+    overlap_participants: list[str] | None = None
     # False = utterance may continue (UI updates text in place).
     is_final: bool = True
 
@@ -62,8 +64,10 @@ class FusedEntry:
             "text": self.text,
             "confidence": round(self.confidence, 3),
             "source_participant_id": self.source_participant_id,
+            "quality": round(self.source_quality, 3),
             "ambiguous": self.ambiguous,
             "language": self.language,
+            "overlap_participants": self.overlap_participants or [],
             "isFinal": self.is_final,
         }
 
@@ -77,3 +81,4 @@ class PipelineDecision:
     quality: float
     speaker_id: str
     text: str
+    source_participant_id: str = ""

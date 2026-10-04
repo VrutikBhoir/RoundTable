@@ -3,6 +3,8 @@
 import base64
 import shutil
 import subprocess
+import io
+import wave
 
 import numpy as np
 
@@ -33,7 +35,52 @@ def _ffmpeg_path() -> str:
 
 
 def decode_upload(data: bytes, filename: str) -> np.ndarray:
-    """Decode wav/mp3/webm/m4a/... bytes to mono float32 16 kHz via ffmpeg."""
+    """Decode uploaded audio to mono float32 16 kHz.
+
+    PyAV handles browser WebM/Opus uploads directly. ffmpeg remains the
+    fallback for formats that PyAV cannot decode.
+    """
+    if filename.lower().endswith(".wav") and not shutil.which("ffmpeg"):
+        try:
+            with wave.open(io.BytesIO(data), "rb") as wav:
+                channels = wav.getnchannels()
+                width = wav.getsampwidth()
+                rate = wav.getframerate()
+                frames = wav.readframes(wav.getnframes())
+            if width != 2 or channels < 1 or rate <= 0:
+                raise ValueError("unsupported WAV format without ffmpeg")
+            raw = np.frombuffer(frames, dtype="<i2").astype(np.float32) / 32768.0
+            if channels > 1:
+                raw = raw.reshape(-1, channels).mean(axis=1)
+            if rate != SAMPLE_RATE:
+                target_size = max(1, round(raw.size * SAMPLE_RATE / rate))
+                raw = np.interp(
+                    np.linspace(0, raw.size - 1, target_size),
+                    np.arange(raw.size),
+                    raw,
+                )
+            return raw.astype(np.float32)
+        except (EOFError, OSError, ValueError) as exc:
+            raise ValueError("could not decode WAV audio") from exc
+    try:
+        import av
+
+        decoded: list[np.ndarray] = []
+        resampler = av.AudioResampler(format="flt", layout="mono", rate=SAMPLE_RATE)
+        with av.open(io.BytesIO(data)) as container:
+            for frame in container.decode(audio=0):
+                converted = resampler.resample(frame)
+                frames = converted if isinstance(converted, list) else [converted]
+                decoded.extend(
+                    np.asarray(item.to_ndarray(), dtype=np.float32).reshape(-1)
+                    for item in frames
+                )
+        if decoded:
+            samples = np.concatenate(decoded).astype(np.float32)
+            if samples.size and np.all(np.isfinite(samples)):
+                return samples
+    except (ImportError, OSError, RuntimeError, ValueError):
+        pass
     try:
         proc = subprocess.run(
             [_ffmpeg_path(), "-hide_banner", "-loglevel", "error",
@@ -46,6 +93,10 @@ def decode_upload(data: bytes, filename: str) -> np.ndarray:
         )
     except subprocess.TimeoutExpired as exc:
         raise ValueError("audio decode timed out") from exc
+    except RuntimeError as exc:
+        raise RuntimeError(
+            "no browser audio decoder is available; install PyAV or ffmpeg"
+        ) from exc
     if proc.returncode != 0 or not proc.stdout:
         raise ValueError("could not decode audio file (unsupported or corrupt?)")
     samples = np.frombuffer(proc.stdout, dtype=np.float32).astype(np.float32)

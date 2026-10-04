@@ -5,10 +5,12 @@ import { Mic, MicOff, Radio, RefreshCw, UserCheck, UserRound, UserX, Users, Volu
 import Navbar from "../components/Navbar";
 import Footer from "../components/Footer";
 import AudioLevelMeter from "../components/mic/AudioLevelMeter";
-import { approveJoinRequest, getLobby, rejectJoinRequest, wsBaseUrl, type JoinRequest } from "../lib/api";
+import { approveJoinRequest, getLobby, getVoiceStatus, lockSession, rejectJoinRequest, unlockSession, wsBaseUrl, type JoinRequest } from "../lib/api";
 import { apiBaseUrl } from "../lib/api";
 import { useSessionAudio } from "../lib/useSessionAudio";
 import { startTranscriptionFeed } from "../lib/transcriptionFeed";
+import { enrollVoiceProfile } from "../lib/voiceEnrollment";
+import { microphoneProcessingStatus } from "../lib/audio";
 import type { ParticipantAudioStreamManager } from "../lib/participantAudio";
 
 export type FusedTranscriptEntry = {
@@ -22,6 +24,8 @@ export type FusedTranscriptEntry = {
   ambiguous: boolean;
   language?: string;
   isFinal?: boolean;
+  quality?: number;
+  overlap_participants?: string[];
 };
 
 type SessionRole = "host" | "participant";
@@ -59,6 +63,12 @@ type PeerSignalMessage = {
   signal_type: "offer" | "answer" | "candidate";
   signal: RTCSessionDescriptionInit | RTCIceCandidateInit;
 };
+
+function upsertJoinRequests(current: JoinRequest[], incoming: JoinRequest[]): JoinRequest[] {
+  const byId = new Map(current.map((request) => [request.id, request]));
+  incoming.forEach((request) => byId.set(request.id, request));
+  return [...byId.values()];
+}
 
 function RemoteAudio({
   peerId,
@@ -249,7 +259,20 @@ export default function RoundtableSession() {
       const byId = new Map(current.map((e) => [e.id, e]));
       let changed = false;
       for (const e of incoming) {
-        if (!e.id || !e.text.trim()) continue;
+        if (!e.id || typeof e.text !== "string" || !e.text.trim()) {
+          continue;
+        }
+        if (import.meta.env.DEV) {
+          console.debug("TRANSCRIPT_EVENT", {
+            participant_id: e.source_participant_id,
+            segment_id: e.id,
+            text: e.text,
+            language: e.language ?? "unknown",
+            confidence: e.confidence,
+            is_final: e.isFinal ?? true,
+            source: "live",
+          });
+        }
         const prev = byId.get(e.id);
         if (!prev || prev.text !== e.text || prev.isFinal !== e.isFinal || prev.end !== e.end) {
           byId.set(e.id, e);
@@ -270,11 +293,27 @@ export default function RoundtableSession() {
   const [requestAction, setRequestAction] = useState<string | null>(null);
   const [mutedParticipants, setMutedParticipants] = useState<Set<string>>(() => new Set());
   const [participantVolumes, setParticipantVolumes] = useState<Record<string, number>>({});
+  const [voiceState, setVoiceState] = useState<"Not enrolled" | "Recording" | "Processing" | "Verified" | "Unavailable">("Not enrolled");
+  const [enrollmentProgress, setEnrollmentProgress] = useState(0);
+  const [enrollmentSpeechSeconds, setEnrollmentSpeechSeconds] = useState<number | null>(null);
+  const [enrollmentDuration, setEnrollmentDuration] = useState<number | null>(null);
+  const [meetingLocked, setMeetingLocked] = useState(false);
 
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimerRef = useRef<number | null>(null);
   const previousParticipantIdsRef = useRef<string[]>([]);
   const remoteAudioElementsRef = useRef(new Map<string, HTMLAudioElement>());
+  const transcriptScrollRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    setTranscriptEntries([]);
+    setSessionEvents([]);
+  }, [sessionId]);
+
+  useEffect(() => {
+    const container = transcriptScrollRef.current;
+    if (container) container.scrollTop = container.scrollHeight;
+  }, [transcriptEntries]);
 
   const localParticipantKey = role === "host" ? "host" : (session?.participantId ?? "participant");
   const audio = useSessionAudio(socket, participants, localParticipantKey);
@@ -319,7 +358,11 @@ export default function RoundtableSession() {
         nextMessages.push({ id: `leave-${id}`, message: `${participant.display_name} left the session`, kind: "leave", at: Date.now() });
       });
       if (nextMessages.length) {
-        setSessionEvents((existing) => [...nextMessages, ...existing].slice(0, 5));
+        setSessionEvents((existing) => {
+          const byId = new Map(existing.map((event) => [event.id, event]));
+          nextMessages.forEach((event) => byId.set(event.id, event));
+          return [...byId.values()].sort((a, b) => b.at - a.at).slice(0, 5);
+        });
       }
     }
     previousParticipantIdsRef.current = currentIds;
@@ -389,7 +432,10 @@ export default function RoundtableSession() {
     const refreshRequests = async () => {
       try {
         const lobby = await getLobby(sessionId, session.hostToken!);
-        if (active) setPendingRequests(lobby.pending_requests);
+        if (active) {
+          setPendingRequests((current) => upsertJoinRequests(current, lobby.pending_requests));
+          setMeetingLocked(lobby.status === "LOCKED");
+        }
       } catch {
         if (active) setPendingRequests([]);
       }
@@ -411,7 +457,7 @@ export default function RoundtableSession() {
       const lobby = decision === "approve"
         ? await approveJoinRequest(sessionId, request.id, session.hostToken)
         : await rejectJoinRequest(sessionId, request.id, session.hostToken);
-      setPendingRequests(lobby.pending_requests);
+      setPendingRequests((current) => upsertJoinRequests(current, lobby.pending_requests));
       const event: SessionEvent = {
         id: `${decision}-${request.id}-${Date.now()}`,
         message: decision === "approve" ? `${request.display_name} was approved to join` : `${request.display_name}'s request was declined`,
@@ -599,6 +645,65 @@ export default function RoundtableSession() {
         ? "Mic live"
         : "Mic offline";
   const connectedAudioPeers = Object.values(audio.peerStates).filter((state) => state === "connected").length;
+  const localNoiseSuppression = audio.localStream ? microphoneProcessingStatus(audio.localStream) : "UNAVAILABLE";
+  const localCredentials: Record<string, string> | null = session?.hostToken
+    ? { host_token: session.hostToken }
+    : session?.participantId && session?.participantToken
+      ? { participant_id: session.participantId, participant_token: session.participantToken }
+      : null;
+
+  useEffect(() => {
+    if (!sessionId || !localCredentials) return;
+    let active = true;
+    void getVoiceStatus(sessionId, localCredentials).then((status) => {
+      console.debug("[voice] live profile lookup", {
+        session_id: sessionId,
+        participant_id: status.participant_id,
+        status: status.status,
+      });
+      if (!active) return;
+      setEnrollmentDuration(status.enrollment_duration_seconds);
+      if (status.status === "ready") setVoiceState("Verified");
+      else if (status.status !== "unavailable") setVoiceState("Not enrolled");
+    }).catch((lookupError) => {
+      console.warn("[voice] live profile lookup failed", {
+        session_id: sessionId,
+        participant_id: session?.participantId ?? "host",
+        error: lookupError instanceof Error ? lookupError.message : lookupError,
+      });
+    });
+    return () => {
+      active = false;
+    };
+  }, [sessionId, session?.hostToken, session?.participantId, session?.participantToken]);
+
+  const startEnrollment = async () => {
+    if (!audio.localStream || !sessionId || !localCredentials) return;
+    setVoiceState("Recording");
+    setEnrollmentProgress(0);
+    try {
+      setVoiceState("Recording");
+      const result = await enrollVoiceProfile({
+        stream: audio.localStream,
+        endpoint: `${apiBaseUrl()}/api/sessions/${encodeURIComponent(sessionId)}/voice-enrollment`,
+        credentials: localCredentials,
+        onProgress: (seconds) => setEnrollmentProgress(seconds),
+        seconds: enrollmentDuration ?? 0,
+        onProcessing: () => setVoiceState("Processing"),
+      });
+      console.debug("[voice] live enrollment response", {
+        session_id: sessionId,
+        participant_id: result.participantId,
+        speech_seconds: result.speechSeconds,
+        recording_seconds: result.recordingSeconds,
+      });
+      setEnrollmentSpeechSeconds(result.speechSeconds);
+      setVoiceState("Verified");
+    } catch (enrollmentError) {
+      setVoiceState("Unavailable");
+      setError(enrollmentError instanceof Error ? enrollmentError.message : "Voice enrollment failed.");
+    }
+  };
 
   const enableRemoteAudio = () => {
     void Promise.all([...remoteAudioElementsRef.current.values()].map((element) => element.play()))
@@ -815,21 +920,25 @@ export default function RoundtableSession() {
 
               <section aria-label="Live transcript" className="rounded-[24px] border border-[#E4E4E0] bg-white p-6 shadow-[0_16px_48px_rgba(0,0,0,0.04)]">
                 <p className="font-mono text-[11px] uppercase tracking-[0.16em] text-[#8A8A86]">Live transcript</p>
-                <div className="mt-4 max-h-72 space-y-2 overflow-y-auto" role="log" aria-label="Live transcript">
+                <div ref={transcriptScrollRef} className="mt-4 max-h-72 space-y-2 overflow-y-auto" role="log" aria-label="Live transcript">
                   {transcriptEntries.length === 0 && (
                     <p className="rounded-xl border border-dashed border-[#E4E4E0] px-4 py-4 text-[13px] text-[#8A8A86]">
                       Captions will appear here as people speak.
                     </p>
                   )}
                   {transcriptEntries.map((entry) => {
+                    const overlapNames = (entry.overlap_participants ?? [])
+                      .map((id) => participants.find((p) => p.id === id)?.display_name ?? id)
+                      .join(" + ");
                     const speakerName = entry.speaker_id === "unknown"
                       ? "Unknown"
                       : entry.speaker_id === "multiple"
-                        ? "Multiple speakers"
+                        ? overlapNames || "Multiple speakers"
                         : participants.find((p) => p.id === entry.speaker_id)?.display_name
                           ?? (entry.speaker_id === localParticipantKey ? (session?.displayName ?? "You") : "Participant");
                     const mm = Math.floor(entry.start / 60).toString().padStart(2, "0");
                     const ss = Math.floor(entry.start % 60).toString().padStart(2, "0");
+                    const showTranscriptText = !entry.ambiguous || entry.confidence >= 0.3;
                     return (
                       <div key={entry.id} className="rounded-2xl bg-[#F7F7F5] px-4 py-3">
                         <p className="text-[11px] font-semibold uppercase tracking-[0.08em] text-[#635BFF]">
@@ -838,11 +947,49 @@ export default function RoundtableSession() {
                             <span className="ml-1.5 inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-[#635BFF]" aria-label="Updating" />
                           )}
                         </p>
-                        <p className="mt-1 text-[14px] leading-relaxed text-[#111]">“{entry.text}”</p>
+                        {showTranscriptText ? (
+                          <p className="mt-1 text-[14px] leading-relaxed text-[#111]">“{entry.text}”</p>
+                        ) : (
+                          <p className="mt-1 text-[14px] leading-relaxed text-[#8A8A86]">
+                            ⚠ Overlapping / uncertain speech
+                          </p>
+                        )}
+                        <p className="mt-1 text-[10px] uppercase tracking-[0.1em] text-[#8A8A86]">
+                          {entry.language && entry.language !== "unknown" ? entry.language : "language uncertain"}
+                          {entry.ambiguous && " · overlapping / uncertain"}
+                        </p>
                       </div>
                     );
                   })}
                 </div>
+              </section>
+
+              <section aria-label="Voice profile" className="rounded-[24px] border border-[#E4E4E0] bg-white p-6 shadow-[0_16px_48px_rgba(0,0,0,0.04)]">
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <p className="font-mono text-[11px] uppercase tracking-[0.16em] text-[#8A8A86]">Voice profile</p>
+                    <p className="mt-2 text-[15px] font-semibold">
+                      {voiceState === "Verified" ? "Voice profile ready" : voiceState}
+                    </p>
+                    {voiceState === "Verified" && enrollmentSpeechSeconds !== null && (
+                      <p className="mt-1 text-[12px] text-[#666]">
+                        Speech detected: {enrollmentSpeechSeconds.toFixed(1)}s / 30s
+                      </p>
+                    )}
+                    {voiceState === "Recording" && (
+                      <p className="mt-1 text-[12px] text-[#666]">Speak naturally: {Math.floor(enrollmentProgress)} / 30 seconds</p>
+                    )}
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => void startEnrollment()}
+                    disabled={!audio.localStream || enrollmentDuration === null || voiceState === "Recording" || voiceState === "Processing"}
+                    className="rounded-full bg-[#111] px-4 py-2 text-[12px] font-semibold text-white disabled:opacity-40"
+                  >
+                    {voiceState === "Verified" ? "Record again" : "Enroll voice"}
+                  </button>
+                </div>
+                <p className="mt-3 text-[12px] text-[#666]">Noise suppression: {localNoiseSuppression}</p>
               </section>
 
               <StreamDiagnostics
@@ -858,6 +1005,30 @@ export default function RoundtableSession() {
                       <p className="font-mono text-[11px] uppercase tracking-[0.16em] text-[#8A8A86]">Host controls</p>
                       <h2 className="mt-2 text-[18px] font-bold">Join requests</h2>
                     </div>                    <span className="grid h-8 min-w-8 place-items-center rounded-full bg-[#F7F7F5] px-2 font-mono text-[12px]">{pendingRequests.length}</span>
+                  </div>
+                  <div className="mt-4 flex items-center justify-between gap-3 rounded-xl bg-[#F7F7F5] px-4 py-3">
+                    <div>
+                      <p className="text-[13px] font-semibold">Late joins</p>
+                      <p className="text-[12px] text-[#666]">{meetingLocked ? "Meeting locked" : "Accepting requests"}</p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (!session?.hostToken || !sessionId) return;
+                        const action = meetingLocked
+                          ? unlockSession(sessionId, session.hostToken)
+                          : lockSession(sessionId, session.hostToken);
+                        void action.then((lobby) => {
+                          setMeetingLocked(lobby.status === "LOCKED");
+                          setPendingRequests(upsertJoinRequests([], lobby.pending_requests));
+                        }).catch((actionError) => {
+                          setError(actionError instanceof Error ? actionError.message : "Could not update meeting lock.");
+                        });
+                      }}
+                      className="inline-flex min-h-9 items-center gap-1.5 rounded-full border border-[#E4E4E0] bg-white px-3 py-2 text-[12px] font-semibold hover:border-[#111]"
+                    >
+                      {meetingLocked ? "Unlock" : "Lock meeting"}
+                    </button>
                   </div>
                   <div className="mt-4 space-y-2">
                     {pendingRequests.length === 0 ? (

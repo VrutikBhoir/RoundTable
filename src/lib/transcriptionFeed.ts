@@ -2,10 +2,9 @@
  * Independent of WebRTC transport (which keeps carrying live audio);
  * results come back over the existing signaling socket as transcript_event.
  *
- * Windows are ~3 s and non-overlapping: the backend VAD splits them into
- * speech regions, accumulates >=1.5 s of speech per participant, and only
- * then calls Whisper — short fragments never reach inference, so captions
- * stay reliable at ~2-3 s latency instead of hallucinating.
+ * Windows are 1.5 s and non-overlapping: the backend VAD splits them into
+ * speech regions and accumulates enough speech for one Whisper call. This
+ * keeps live captions responsive while still filtering silence and scraps.
  */
 
 const WORKLET_CODE = `
@@ -38,11 +37,10 @@ class FeedCapture extends AudioWorkletProcessor {
 registerProcessor("rt-feed-capture", FeedCapture);
 `;
 
-// Stable rolling windows: speech posts ~3 s after it starts being spoken.
-// Shorter windows starve Whisper of context (hallucinations); the backend
-// VAD splits windows into speech regions and accumulates them to >=1.5 s
-// of speech before any inference call.
-const WINDOW_S = 3;
+// A shorter cadence reduces capture-to-caption latency. The backend still
+// buffers speech regions, so Whisper is not called for every AudioWorklet
+// chunk or for digital silence.
+const WINDOW_S = 1.5;
 
 export type FeedCredentials =
   | { participant_id: string; participant_token: string }
@@ -73,16 +71,55 @@ export function startTranscriptionFeed(options: {
   const feedT0 = Date.now();
   let acc = new Float32Array(0);
   let windowStartS = 0;
+  let workletChunks = 0;
+  let nonZeroWorkletChunks = 0;
+  let uploadedWindows = 0;
+  const participantId = "participant_id" in credentials ? credentials.participant_id : "host";
+
+  const debug = (message: string, details: Record<string, unknown>) => {
+    if (import.meta.env.DEV) console.debug(message, details);
+  };
+
+  const track = stream.getAudioTracks()[0];
+  debug("[MICROPHONE]", {
+    participant_id: participantId,
+    stream_active: stream.active,
+    audio_track_count: stream.getAudioTracks().length,
+    track_ready_state: track?.readyState ?? "missing",
+    track_enabled: track?.enabled ?? false,
+    track_muted: track?.muted ?? false,
+    audio_context_state: context.state,
+  });
 
   const postWindow = (pcm: Float32Array, t0: number) => {
     const payload = { ...credentials, t0, pcm_b64: "" };
     const run = async () => {
       try {
         (payload as Record<string, unknown>).pcm_b64 = await blobToB64(pcm);
+        const nonZero = pcm.reduce((count, value) => count + (value !== 0 ? 1 : 0), 0);
+        const peak = pcm.reduce((current, value) => Math.max(current, Math.abs(value)), 0);
+        const rms = Math.sqrt(pcm.reduce((sum, value) => sum + value * value, 0) / Math.max(1, pcm.length));
+        uploadedWindows += 1;
+        debug("[AUDIO UPLOAD]", {
+          participant_id: participantId,
+          segment_duration_s: pcm.length / 16000,
+          pcm_sample_count: pcm.length,
+          sample_rate: 16000,
+          rms,
+          peak_amplitude: peak,
+          non_zero_percent: (nonZero / Math.max(1, pcm.length)) * 100,
+          base64_length: String((payload as { pcm_b64: string }).pcm_b64).length,
+          upload_index: uploadedWindows,
+        });
         const res = await fetch(
           `${apiBase}/api/sessions/${encodeURIComponent(sessionId)}/audio-segments`,
           { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) }
         );
+        debug("[AUDIO UPLOAD RESULT]", {
+          participant_id: participantId,
+          status: res.status,
+          accepted: res.ok,
+        });
         if (!res.ok && options.onError) {
           options.onError(`transcription upload failed (${res.status})`);
         }
@@ -97,6 +134,20 @@ export function startTranscriptionFeed(options: {
 
   const onChunk = (chunk: Float32Array) => {
     if (stopped) return;
+    workletChunks += 1;
+    const chunkNonZero = chunk.some((value) => value !== 0);
+    if (chunkNonZero) nonZeroWorkletChunks += 1;
+    if (workletChunks === 1 || workletChunks % 25 === 0) {
+      debug("[AUDIOWORKLET PCM]", {
+        participant_id: participantId,
+        chunk_sample_count: chunk.length,
+        sample_rate: 16000,
+        non_zero: chunkNonZero,
+        chunks_received: workletChunks,
+        non_zero_chunks: nonZeroWorkletChunks,
+        audio_context_state: context.state,
+      });
+    }
     const merged = new Float32Array(acc.length + chunk.length);
     merged.set(acc);
     merged.set(chunk, acc.length);
@@ -114,6 +165,16 @@ export function startTranscriptionFeed(options: {
         if (v > peak) peak = v;
       }
       if (peak > 0.008) postWindow(window, t0);
+      else {
+        debug("[AUDIO WINDOW SKIPPED]", {
+          participant_id: participantId,
+          segment_duration_s: window.length / 16000,
+          pcm_sample_count: window.length,
+          sample_rate: 16000,
+          peak_amplitude: peak,
+          reason: "local_peak_gate",
+        });
+      }
     }
   };
 
@@ -136,7 +197,13 @@ export function startTranscriptionFeed(options: {
         if (data && data.length) onChunk(new Float32Array(data));
       };
       source.connect(node);
-      void feedT0;
+      debug("[AUDIOWORKLET READY]", {
+        participant_id: participantId,
+        audio_context_state: context.state,
+        track_ready_state: track?.readyState ?? "missing",
+        track_enabled: track?.enabled ?? false,
+        feed_start_ms: feedT0,
+      });
     } catch {
       if (options.onError) options.onError("local transcription capture unavailable in this browser");
     }

@@ -75,6 +75,7 @@ class SessionRecord:
     participants: dict[str, ParticipantRecord] = field(default_factory=dict)
     requests: dict[str, JoinRequestRecord] = field(default_factory=dict)
     invitation: Optional[InvitationRecord] = None
+    locked_from_started: bool = False
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
@@ -276,10 +277,16 @@ class InMemorySessionStore:
 
     async def set_locked(self, record: SessionRecord, locked: bool) -> None:
         async with record.lock:
-            if record.status in {SessionStatus.STARTING, SessionStatus.STARTED, SessionStatus.ENDED}:
+            if record.status in {SessionStatus.STARTING, SessionStatus.ENDED}:
                 raise ValueError("session_already_started")
             if locked:
+                record.locked_from_started = record.status == SessionStatus.STARTED
                 record.status = SessionStatus.LOCKED
+            elif record.status == SessionStatus.LOCKED:
+                record.status = SessionStatus.STARTED if record.locked_from_started else (
+                    SessionStatus.FULL if len(record.participants) >= record.capacity else SessionStatus.WAITING
+                )
+                record.locked_from_started = False
             elif len(record.participants) < record.capacity:
                 record.status = SessionStatus.WAITING
             else:

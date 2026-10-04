@@ -1,6 +1,6 @@
-"""faster-whisper transcription. English-only for the MVP (WHISPER_LANGUAGE=en).
+"""faster-whisper transcription with multilingual language detection.
 
-Transcription only — never translation.
+Transcription only — no translation is requested.
 """
 
 import math
@@ -12,10 +12,7 @@ import numpy as np
 MODEL_NAME = os.getenv("WHISPER_MODEL", "small")
 _DEVICE = os.getenv("WHISPER_DEVICE", "auto")
 _COMPUTE = os.getenv("WHISPER_COMPUTE_TYPE", "auto")
-# English-only MVP: any other value falls back to "en".
-_LANGUAGE = os.getenv("WHISPER_LANGUAGE", "en").strip().lower() or "en"
-if _LANGUAGE != "en":
-    _LANGUAGE = "en"
+_LANGUAGE = os.getenv("WHISPER_LANGUAGE", "auto").strip().lower() or "auto"
 
 _model = None
 _model_key: tuple | None = None
@@ -25,6 +22,9 @@ _load_error: str | None = None
 # step, and unbounded parallel jobs would thrash GPU/CPU. transcribe()
 # always runs inside a worker thread, so a blocking acquire is safe.
 _infer_slots = threading.Semaphore(2)
+_MAX_NO_SPEECH_PROB = 0.6
+_MAX_COMPRESSION_RATIO = 2.4
+_MIN_AVG_LOGPROB = -1.0
 
 
 def resolve_device() -> str:
@@ -47,7 +47,7 @@ def resolve_compute_type(device: str) -> str:
 
 
 def resolve_language() -> str:
-    """Configured transcription language. English-only MVP: always 'en'."""
+    """Configured language, or ``auto`` for faster-whisper detection."""
     return _LANGUAGE
 
 
@@ -83,21 +83,18 @@ def warmup() -> bool:
         return False
 
 
-def transcribe(samples: np.ndarray) -> tuple[str, float, str] | None:
-    """Transcribe 16 kHz mono float32 English speech. Returns (text, confidence, language).
-
-    None = failed/skipped (never raises). Language is always "en" (forced,
-    never detected, never translated).
-    """
+def transcribe(samples: np.ndarray, participant_id: str | None = None) -> tuple[str, float, str] | None:
+    """Transcribe 16 kHz mono float32 speech without translating it."""
     try:
         model = get_model()
         kwargs: dict = {
-            "language": "en",
             "beam_size": 3,
             "temperature": 0.0,
             "vad_filter": False,  # we already ran our own VAD
             "condition_on_previous_text": False,  # segments are independent; avoids cross-speaker repetition
         }
+        if _LANGUAGE != "auto":
+            kwargs["language"] = _LANGUAGE
         segments, _info = None, None
         with _infer_slots:
             segments, _info = model.transcribe(samples.astype(np.float32), **kwargs)
@@ -105,13 +102,43 @@ def transcribe(samples: np.ndarray) -> tuple[str, float, str] | None:
         logprobs: list[float] = []
         for seg in segments:
             t = (seg.text or "").strip()
-            if t:
-                texts.append(t)
-                logprobs.append(seg.avg_logprob if seg.avg_logprob is not None else -1.0)
+            if not t:
+                continue
+            no_speech_prob = getattr(seg, "no_speech_prob", 0.0) or 0.0
+            compression_ratio = getattr(seg, "compression_ratio", 0.0) or 0.0
+            avg_logprob = getattr(seg, "avg_logprob", None)
+            if (
+                no_speech_prob > _MAX_NO_SPEECH_PROB
+                or compression_ratio > _MAX_COMPRESSION_RATIO
+                or (avg_logprob is not None and avg_logprob < _MIN_AVG_LOGPROB)
+            ):
+                print(
+                    "[WHISPER_SEGMENT] "
+                    f"participant_id={participant_id or 'unknown'} "
+                    f"text={t!r} language=pending "
+                    f"no_speech_prob={no_speech_prob:.3f} "
+                    f"compression_ratio={compression_ratio:.3f} "
+                    f"avg_logprob={avg_logprob} accepted=False "
+                    "reason=quality_metadata",
+                    flush=True,
+                )
+                continue
+            print(
+                "[WHISPER_SEGMENT] "
+                f"participant_id={participant_id or 'unknown'} "
+                f"text={t!r} language=pending "
+                f"no_speech_prob={no_speech_prob:.3f} "
+                f"compression_ratio={compression_ratio:.3f} "
+                f"avg_logprob={avg_logprob} accepted=True reason=accepted",
+                flush=True,
+            )
+            texts.append(t)
+            logprobs.append(avg_logprob if avg_logprob is not None else -1.0)
         text = " ".join(texts).strip()
         if not text:
             return None
         confidence = math.exp(sum(logprobs) / len(logprobs)) if logprobs else 0.0
-        return text, max(0.0, min(1.0, confidence)), "en"
+        detected = getattr(_info, "language", None) or (_LANGUAGE if _LANGUAGE != "auto" else "unknown")
+        return text, max(0.0, min(1.0, confidence)), str(detected)
     except Exception:
         return None

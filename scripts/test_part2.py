@@ -165,7 +165,7 @@ try:
     out = transcription.transcribe(speech_like(3.0))
     m1 = transcription.get_model()
     check("model cached", transcription.get_model() is m1)
-    check("language fixed to English", transcription.resolve_language() == "en")
+    check("multilingual auto-detection configured", transcription.resolve_language() == "auto")
     check("result shape has language", out is None or (len(out) == 3 and isinstance(out[2], str)))
     if out is not None:
         check("entry carries language", True)

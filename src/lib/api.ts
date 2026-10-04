@@ -165,3 +165,16 @@ export function getInvitationPreview(token: string) {
 export function getJoinRequestStatus(token: string, requestId: string) {
   return request<JoinRequestStatus>(`/api/invitations/${encodeURIComponent(token)}/requests/${encodeURIComponent(requestId)}`);
 }
+
+export function getVoiceStatus(
+  sessionId: string,
+  credentials: { host_token?: string; participant_id?: string; participant_token?: string },
+) {
+  const params = new URLSearchParams();
+  Object.entries(credentials).forEach(([key, value]) => {
+    if (value) params.set(key, value);
+  });
+  return request<{ participant_id: string; status: string; enrollment_duration_seconds: number }>(
+    `/api/sessions/${encodeURIComponent(sessionId)}/voice-status?${params.toString()}`,
+  );
+}

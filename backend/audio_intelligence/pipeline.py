@@ -11,7 +11,7 @@ import time
 
 import numpy as np
 
-from . import audio_io, attribution, dedupe, quality, selection, transcription
+from . import audio_io, attribution, dedupe, quality, selection, transcription, voice
 from .attribution import TemporalVoter
 from .fusion import FusionStore
 from .models import AudioSegment, FusedEntry, PipelineDecision
@@ -22,14 +22,17 @@ _DUP_IOU = 0.35
 _DUP_QUALITY_MARGIN = 0.05
 # Whisper hallucinates on scraps ("thank you" on 0.3 s fragments), so speech
 # accumulates per participant before any inference call.
-MIN_SPEECH_S = 1.5  # buffer this much speech before transcribing
-FLUSH_MIN_S = 1.0  # silence-closed buffers flush early at this size
+MIN_SPEECH_S = 1.0  # buffer this much speech before transcribing
+FLUSH_MIN_S = 0.8  # silence-closed buffers flush early at this size
 MAX_BUFFER_S = 8.0  # force-emit cap so long utterances stay bounded
-HARD_FLOOR_S = 0.8  # defense in depth: never transcribe below this
+HARD_FLOOR_S = 0.65  # defense in depth: never transcribe tiny scraps
+MIN_TRANSCRIPT_CONFIDENCE = 0.30
+MIN_TRANSCRIPT_QUALITY = 0.10
 
 
 class SessionIntelligence:
     def __init__(self) -> None:
+        self._session_id = ""
         self.vad = SileroVAD()
         self.voter = TemporalVoter()
         self.fusion = FusionStore()
@@ -62,19 +65,52 @@ class SessionIntelligence:
         if dur_s < HARD_FLOOR_S or samples.size < 1600 or audio_io.is_silent(samples):
             return []  # too short / too quiet: Whisper would hallucinate
         q = quality.score_segment(samples)
-        if q.score <= 0.0:
+        print(
+            f"[AUDIO_SEGMENT] participant_id={seg.participant_id} "
+            f"duration={dur_s:.2f}s vad_speech_duration={dur_s:.2f}s "
+            f"rms={q.rms:.4f} quality={q.score:.3f}",
+            flush=True,
+        )
+        if q.score < MIN_TRANSCRIPT_QUALITY:
             return []
         dup = self._duplicate_of(seg, q.score, now)
         if dup is not None:
             return []  # another phone's copy already transcribed
         print(f"[WHISPER] started seg={dur_s:.2f}s q={q.score:.2f}", flush=True)
         t_whisper = time.time()
-        result = transcription.transcribe(samples)
+        print(
+            f"[WHISPER] participant_id={seg.participant_id} "
+            f"audio_duration_sent={dur_s:.2f}s phase=before",
+            flush=True,
+        )
+        result = transcription.transcribe(samples, participant_id=seg.participant_id)
         whisper_ms = (time.time() - t_whisper) * 1000
         print(f"[WHISPER] finished in {whisper_ms:.0f}ms", flush=True)
         if result is None:
+            print(
+                f"[WHISPER] participant_id={seg.participant_id} "
+                f"audio_duration_sent={dur_s:.2f}s returned_text='' "
+                "language=unknown accepted=False reason=no_usable_result",
+                flush=True,
+            )
             return []
         text, confidence, language = result
+        text = text.strip()
+        if not text or confidence < MIN_TRANSCRIPT_CONFIDENCE:
+            print(
+                f"[TRANSCRIPT] discarded seg={dur_s:.2f}s "
+                f"reason={'empty' if not text else 'low_confidence'} "
+                f"confidence={confidence:.3f} quality={q.score:.3f}",
+                flush=True,
+            )
+            return []
+        print(
+            f"[WHISPER] participant_id={seg.participant_id} "
+            f"audio_duration_sent={dur_s:.2f}s returned_text={text!r} "
+            f"language={language} confidence={confidence:.3f} "
+            "accepted=True reason=accepted",
+            flush=True,
+        )
         # Guard against a second phone's near-identical text racing us.
         for d in self.decisions:
             if (
@@ -82,12 +118,44 @@ class SessionIntelligence:
                 and dedupe.is_duplicate(text, d.text)
             ):
                 return []
-        speaker, conf, ambiguous = self.voter.vote(seg.participant_id, seg.start, seg.end, q.score, confidence)
-        entry = self.fusion.add(speaker, seg.start, seg.end, text, min(confidence, conf), seg.participant_id, ambiguous, language, seg.final)
+        voice_speaker, voice_conf = voice.voice_profiles.identify(self._session_id, samples)
+        source_speaker, source_conf, ambiguous = self.voter.vote(
+            seg.participant_id, seg.start, seg.end, q.score, confidence
+        )
+        if voice_speaker != "unknown" and voice_conf >= source_conf:
+            speaker, conf = voice_speaker, voice_conf
+        elif voice.voice_profiles.has_profiles(self._session_id) and voice_speaker == "unknown":
+            speaker, conf, ambiguous = "unknown", 0.0, True
+        else:
+            speaker, conf = source_speaker, source_conf
+        overlapping = sorted({
+            d.source_participant_id
+            for d in self.decisions
+            if d.source_participant_id
+            and d.source_participant_id != seg.participant_id
+            and selection.iou(seg.start, seg.end, d.start, d.end) >= _DUP_IOU
+            and not dedupe.is_duplicate(text, d.text)
+        } | {seg.participant_id})
+        if len(overlapping) > 1:
+            speaker, conf, ambiguous = "multiple", min(confidence, conf), True
+        entry = self.fusion.add(
+            speaker, seg.start, seg.end, text, min(confidence, conf), seg.participant_id,
+            source_quality=q.score, ambiguous=ambiguous, language=language, is_final=seg.final,
+            overlap_participants=overlapping if len(overlapping) > 1 else None,
+        )
         new: list[FusedEntry] = []
         if entry is not None:
             new.append(entry)
-            self.decisions.append(PipelineDecision(seg.start, seg.end, q.score, speaker, text))
+            self.decisions.append(PipelineDecision(seg.start, seg.end, q.score, speaker, text, seg.participant_id))
+        for emitted in new:
+            print(
+                "[TRANSCRIPT_EVENT] "
+                f"participant_id={emitted.source_participant_id} "
+                f"segment_id={emitted.id} text={emitted.text!r} "
+                f"language={emitted.language} confidence={emitted.confidence:.3f} "
+                f"is_final={emitted.is_final} source=live",
+                flush=True,
+            )
         print(f"[TRANSCRIPT] sent final={seg.final} entries={len(new)}", flush=True)
         print(
             f"[LAT] seg={dur_s:.2f}s whisper={whisper_ms:.0f}ms "
@@ -105,9 +173,11 @@ class SessionIntelligence:
         out: list[AudioSegment] = []
         chunk_s = len(samples) / 16000
         regions = self.vad.segment(samples)
+        speech_duration = sum(end - start for start, end in regions)
         print(
-            f"[VAD] participant={participant_id} chunk={chunk_s:.2f}s "
-            f"regions={len(regions)} " +
+            f"[VAD] participant_id={participant_id} input_duration={chunk_s:.2f}s "
+            f"detected_speech_duration={speech_duration:.2f}s "
+            f"speech_detected={bool(regions)} regions={len(regions)} " +
             " ".join(f"{s:.2f}-{e:.2f}" for s, e in regions),
             flush=True,
         )
@@ -196,6 +266,7 @@ class IntelligencePipeline:
         state = self.sessions.get(session_id)
         if state is None:
             state = SessionIntelligence()
+            state._session_id = session_id
             self.sessions[session_id] = state
         return state
 
@@ -239,9 +310,11 @@ class IntelligencePipeline:
         state = self.sessions.get(session_id)
         if state:
             state.remove_participant(participant_id)
+            voice.voice_profiles.remove_participant(session_id, participant_id)
 
     def end_session(self, session_id: str) -> None:
         self.sessions.pop(session_id, None)
+        voice.voice_profiles.clear_session(session_id)
 
 
 pipeline = IntelligencePipeline()
